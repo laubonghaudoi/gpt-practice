@@ -1,3 +1,4 @@
+import tiktoken
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
@@ -29,7 +30,7 @@ class CasualSelfAttention(nn.Module):
         # not really a `bias`, more of a mask, but following the OpenAI/HF naming though
         self.register_buffer(
             "bias", torch.tril(torch.ones(
-                config.block_size, config.block_size))
+                config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size)
         )
 
     def forward(self, x):
@@ -38,7 +39,7 @@ class CasualSelfAttention(nn.Module):
         # Calculate key, query, value for alll heads in a batch and move head forward to be the batch dim
         # nh is "number of heads", hs is "head size", and C is (number of heads) = nh * hs
         # e.g. in GPT-2 (124M), nh=12, hs=64, so nh*hs=C=768 channels in the Transformer
-        qkv = self.c_atten(x)
+        qkv = self.c_attn(x)
         q, k, v = qkv.split(self.n_embed, dim=2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(
             1, 2
@@ -51,7 +52,7 @@ class CasualSelfAttention(nn.Module):
         )  # (B, nh, T, hs)
         # attention (materialize the large (T, T) matrix for all the queries and keys)
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:, :T, :T] == 0, float("-inf"))
+        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float("-inf"))
         att = F.softmax(att, dim=-1)
         y = att @ v  # (B, nh, T, hs)
         # re-assemble all head outputs side by side
@@ -189,3 +190,32 @@ model = GPT.from_pretrained("gpt2")
 model.eval()
 model.to("cuda")
 print(model)
+
+
+enc = tiktoken.get_encoding("gpt2")
+tokens = enc.encode("Hello, my name is")
+tokens = torch.tensor(tokens, dtype=torch.long)
+tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+x = tokens.to("cuda")
+
+
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+while x.size(1) < max_length:
+    with torch.no_grad():
+        logits = model(x)  # (B, T, vocab_size)
+        # take the logits at the last position
+        logits = logits[:, -1, :]
+        probs = F.softmax(logits, dim=-1)
+        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+        # select a token from the top-k probabilities
+        ix = torch.multinomial(topk_probs, 1)  # (B, 1)
+        # gather the corresponding indices
+        xcol = torch.gather(topk_indices, dim=-1, index=ix)  # (B, 1)
+        # append to the sequence
+        x = torch.cat((x, xcol), dim=1)
+
+for i in range(num_return_sequences):
+    tokens = x[i,: max_length].tolist()
+    decoded = enc.decode(tokens)
+    print(decoded)
