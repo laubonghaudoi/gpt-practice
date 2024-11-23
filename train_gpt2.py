@@ -1,9 +1,11 @@
-import tiktoken
+import math
+import os
 from dataclasses import dataclass
+
+import tiktoken
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-import math
 
 
 @dataclass
@@ -52,7 +54,7 @@ class CasualSelfAttention(nn.Module):
         )  # (B, nh, T, hs)
         # attention (materialize the large (T, T) matrix for all the queries and keys)
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float("-inf"))
+        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
         att = F.softmax(att, dim=-1)
         y = att @ v  # (B, nh, T, hs)
         # re-assemble all head outputs side by side
@@ -183,20 +185,30 @@ class GPT(nn.Module):
 
 
 # --------------------------------------------------------------------------------------------
+device = "cpu"
+if torch.cuda.is_available():
+    device = "cuda"
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device = "mps"
+print("Using device:", device)
+
 num_return_sequences = 5
 max_length = 30
 
-model = GPT.from_pretrained("gpt2")
+# model = GPT.from_pretrained("gpt2")
+model = GPT(GPTConfig())
 model.eval()
-model.to("cuda")
-print(model)
+model.to(device)
+os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
+
+# print(model)
 
 
 enc = tiktoken.get_encoding("gpt2")
 tokens = enc.encode("Hello, my name is")
 tokens = torch.tensor(tokens, dtype=torch.long)
 tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-x = tokens.to("cuda")
+x = tokens.to(device)
 
 
 torch.manual_seed(42)
@@ -216,6 +228,6 @@ while x.size(1) < max_length:
         x = torch.cat((x, xcol), dim=1)
 
 for i in range(num_return_sequences):
-    tokens = x[i,: max_length].tolist()
+    tokens = x[i, : max_length].tolist()
     decoded = enc.decode(tokens)
     print(decoded)
