@@ -1,3 +1,4 @@
+import sys
 import math
 import os
 from dataclasses import dataclass
@@ -11,7 +12,7 @@ from torch.nn import functional as F
 @dataclass
 class GPTConfig:
     block_size: int = 256
-    vocab_size: int = 65
+    vocab_size: int = 50257
     n_layer: int = 6
     n_head: int = 6
     n_embd: int = 384
@@ -107,7 +108,22 @@ class GPT(nn.Module):
         )
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-    def forward(self, idx):
+        # weight sharing
+        self.transformer.wpe.weight = self.lm_head.weight
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, "NANOGPT_SCALE_INIT"):
+                std *= (2 * self.config.n_layer) ** -0.5
+
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, idx, targets=None):
         B, T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward {T}"
         # forward the token and position embeddings
@@ -118,8 +134,12 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
-        logits = self.lm_head(x)
-        return logits
+        logits = self.lm_head(x)  # (B, T, vocab_size)
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)), targets.view(-1))  # (B*T)
+        return logits, loss
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -185,6 +205,37 @@ class GPT(nn.Module):
 
 
 # --------------------------------------------------------------------------------------------
+class DataLoaderLite:
+    def __init__(self, B, T, ):
+        self.B = B
+        self.T = T
+        with open('input.txt', 'r') as file:
+            text = file.read()
+        # get a data batch
+        enc = tiktoken.get_encoding("gpt2")
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+
+        print(f"loaded {len(self.tokens)} tokens")
+        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
+
+        # state
+        self.current_position = 0
+
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position: self.current_position + B * T + 1]
+        x = buf[:-1].view(B, T)
+        y = buf[1:].view(B, T)
+        # advance the position in the tensor
+        self.current_position += B * T
+        if self.current_position + B * T + 1 >= len(self.tokens):
+            self.current_position = 0
+        return x, y
+
+
+# --------------------------------------------------------------------------------------------
+# attempt to auto detect the device
 device = "cpu"
 if torch.cuda.is_available():
     device = "cuda"
@@ -192,25 +243,31 @@ elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
     device = "mps"
 print("Using device:", device)
 
-num_return_sequences = 5
-max_length = 30
+train_loader = DataLoaderLite(B=4, T=32)
 
 # model = GPT.from_pretrained("gpt2")
 model = GPT(GPTConfig())
-model.eval()
 model.to(device)
-os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 
-# print(model)
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+for i in range(100):
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    optimizer.zero_grad()
+    logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+
+    print(f"step {i}, loss {loss.item()}")
+
+sys.exit(0)
 
 
-enc = tiktoken.get_encoding("gpt2")
-tokens = enc.encode("Hello, my name is")
-tokens = torch.tensor(tokens, dtype=torch.long)
-tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-x = tokens.to(device)
+# --------------------------------------------------------------------------------------------
+max_length = 100
+num_return_sequences = 2
 
-
+model.eval()
 torch.manual_seed(42)
 torch.cuda.manual_seed(42)
 while x.size(1) < max_length:
