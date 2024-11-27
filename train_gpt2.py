@@ -1,3 +1,4 @@
+import time
 import sys
 import math
 import os
@@ -11,7 +12,7 @@ from torch.nn import functional as F
 
 @dataclass
 class GPTConfig:
-    block_size: int = 256
+    block_size: int = 1024
     vocab_size: int = 50257
     n_layer: int = 6
     n_head: int = 6
@@ -54,10 +55,13 @@ class CasualSelfAttention(nn.Module):
             1, 2
         )  # (B, nh, T, hs)
         # attention (materialize the large (T, T) matrix for all the queries and keys)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
-        att = F.softmax(att, dim=-1)
-        y = att @ v  # (B, nh, T, hs)
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
+        # att = F.softmax(att, dim=-1)
+        # y = att @ v  # (B, nh, T, hs)
+
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
         # re-assemble all head outputs side by side
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
@@ -236,6 +240,7 @@ class DataLoaderLite:
 
 # --------------------------------------------------------------------------------------------
 # attempt to auto detect the device
+
 device = "cpu"
 if torch.cuda.is_available():
     device = "cuda"
@@ -243,22 +248,28 @@ elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
     device = "mps"
 print("Using device:", device)
 
-train_loader = DataLoaderLite(B=4, T=32)
-
+train_loader = DataLoaderLite(B=8, T=1024)
+torch.set_float32_matmul_precision("high")
 # model = GPT.from_pretrained("gpt2")
 model = GPT(GPTConfig())
 model.to(device)
+model = torch.compile(model)
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
 for i in range(100):
+    t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    logits, loss = model(x, y)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
     loss.backward()
     optimizer.step()
-
-    print(f"step {i}, loss {loss.item()}")
+    torch.cuda.synchronize()
+    t1 = time.time()
+    dt = t1 - t0
+    tokens_per_sec = (train_loader.B * train_loader.T) / dt
+    print(f"step {i}, loss {loss.item()}, time {dt:.2f} sec, tokens/sec {tokens_per_sec:.2f}")
 
 sys.exit(0)
 
