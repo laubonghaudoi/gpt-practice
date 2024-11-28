@@ -270,6 +270,14 @@ elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
     device = "mps"
 print("Using device:", device)
 
+total_batch_size = 2**19
+B = 32  # micro batch size
+T = 1024  # sequence length
+assert total_batch_size % (B * T) == 0, "make sure total_batch_size is divisible by B * T"
+grad_accum_steps = total_batch_size // (B * T)
+print(f"Total desired batch size: {total_batch_size}, B: {B}, T: {T}")
+print(f"grad_accum_steps: {grad_accum_steps}")
+
 train_loader = DataLoaderLite(B=8, T=1024)
 torch.set_float32_matmul_precision("high")
 # model = GPT.from_pretrained("gpt2")
@@ -299,12 +307,17 @@ optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, dev
 
 for i in range(100):
     t0 = time.time()
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        logits, loss = model(x, y)
-    loss.backward()
+    loss_accum = 0.0
+    for micro_step in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
+        loss = loss / grad_accum_steps
+        loss_accum += loss.detach()
+        loss.backward()
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     lr = get_lr(i)
     for param_group in optimizer.param_groups:
@@ -313,8 +326,9 @@ for i in range(100):
     torch.cuda.synchronize()
     t1 = time.time()
     dt = t1 - t0
-    tokens_per_sec = (train_loader.B * train_loader.T) / dt
-    print(f"step {i}, loss {loss.item()}, lr {lr:.4e}, norm {norm:.4f}, time {dt * 1000:.2f} ms, tokens/sec {tokens_per_sec:.2f}")
+    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps
+    tokens_per_sec = tokens_processed / dt
+    print(f"step {i}, loss {loss_accum.item():.6f}, lr {lr:.4e}, norm {norm:.4f}, time {dt * 1000:.2f} ms, tokens/sec {tokens_per_sec:.2f}")
 
 sys.exit(0)
 
